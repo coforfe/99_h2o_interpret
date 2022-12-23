@@ -1,0 +1,201 @@
+---
+title: "Interpretabilidad con H2O"
+output: html_document
+date: "2022-12-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+***
+
+# Introducción
+Vamos a presentar diferentes formas de analizar la interpretabiliad de un modelo usando las capacidades que ofrece H2O.
+
+ * Crearemos un modelo sobre los datos de "Lending Club" para predecir qué casos se producen "bad loans".
+ * El modelo será del tipo de GBM
+ * Y sobre el modelo resultante, aplicaremos diferentes enfoque de explicatividad.
+ 
+
+# Carga de librerías y datos
+Usaremos la última versión de H2O disponible para crear el modelo y los datos los conseguimos directamente de una dirección Web.
+
+```{r arranque_h2o}
+#-- Librerias necesarias
+suppressPackageStartupMessages({
+ library(h2o)
+ library(ggplot2)
+ library(kableExtra)
+ library(magrittr)
+})
+
+h2o.init( max_mem_size = "4G")
+h2o.no_progress()
+
+set.seed(12345)
+
+
+input_csv = "https://s3.amazonaws.com/data.h2o.ai/Machine-Learning-at-Scale/lending_club/loans.csv"
+
+loans <- h2o.importFile(input_csv)
+head(loans) %>% kable()
+```
+
+La variable objetivo es **bad_loan**
+
+# Modelo
+Vamos a entrenar un modelo del tipo _GBM_, y para ello tenemos que recordar que la variable objetivo ha de ser de tipo factor para que el modelo sea de clasificación. Eliminando la variable _issue_id_ que no aporta señal al modelo.
+
+Por otro lado vamos a crear tres conjuntos de datos: para entrenar, validad y testar el resultado del modelo.
+
+```{r modelo}
+# Convertimos la variable objetivo en factor. Definimos el resto como predictoras.
+y <- 'bad_loan'
+x <- setdiff(names(loans), c(y, "issue_d"))
+
+loans[, y] <- as.factor(loans[, y])
+
+# Definimos los splits
+loan_split <- h2o.splitFrame(
+  loans, 
+  ratios = c(0.7, 0.15),  # ppariticionado de datos en 70%, 15% y 15%
+  destination_frames = c("train", "valid", "test"), # particionados
+  seed = 12345 # por reproducibilidad
+)
+
+train <- loan_split[[1]]
+valid <- loan_split[[2]]
+test  <- loan_split[[3]]
+
+
+model_gbm <- h2o.gbm(
+                      x                = x,
+                      y                = y,
+                      training_frame   = train,
+                      validation_frame = valid,
+                      model_id         = 'modelo_base_gbm'
+)
+
+# Métricas del resultado del modelo
+model_gbm
+```
+
+El resultado del modelo _model_gbm_ incluye un resumen completo del modelo, incluyendo las métricas asociadas al conjunto de entrenamiento y de validación: matriz de confusión, F1, historia del scoring, etc.
+
+Vemos que el modelo consigue un nivel de _AUC_ de 0.80 sobre el conjunto de entrenamiento, que baja al 0.72 sobre el conjunto de validación.
+
+Y sobre el conjunto de _test_ :
+
+```{r conjunto_test}
+h2o.auc(h2o.performance(model_gbm, test))
+```
+
+que baja a 0.69.
+
+Aunque no es nuestro objetivo en este momento, el modelo está sobre-ajustando sobre el conjunto de entrenamiento.
+
+
+# Explicatividad del modelo.
+La explicatividad se puede plantear a diferentes niveles:
+
+ * Global
+ * Local
+ 
+## Explicatividad Global
+La _explicatividad global_ se refiere a la habilidad del modelo para proporcionar explicaciones de sus predicciones a nivel global, y no para entradas individuales. De esta forma, obtendremos explicaciones del modelo de forma general. De esta forma podemos entender el comportamiento global del modelo y confiar en sus predicciones globales.
+
+La explicatividad a nivel global se obtiene con la función _h2o.explain(modelo, test)_, y en su ejecución obtendremos diferentes salidas:
+
+ * Matriz de Confusión.
+ * Gráfico de importancia de variables.
+ * El gráfico resumen SHAP.
+ * Los gráficos de dependencia parcial (PDPs)
+ 
+También se pueden obtener estos resultados de forma independiente, veamos una explicación de cada uno de ellos.
+
+### Matriz de Confusión
+La matriz de confusión muestra de forma comparada los resultados del modelo sobre la variable objetivo, frente a los valores reales.
+
+```{r confusion}
+h2o.confusionMatrix(model_gbm)
+```
+
+### Variables Importantes
+El gráfico de variables importantes, muestran la importancia relativa de las variables más importantes en el modelo.
+
+```{r variables}
+h2o.varimp_plot(model_gbm)
+```
+
+### Gráfico SHAP
+El gráfico SHAP (SHapley Additive exPlanations) permite comprender la contribución de cada característica al resultado previsto, teniendo en cuenta las interacciones y dependencias entre características. El gráfico resumen SHAP muestra la contribución de las características para cada instancia (fila de datos). Estos gráficos proporcionan una visión general de qué características son más importantes para el modelo. Un gráfico de resumen SHAP se crea trazando los valores SHAP de cada característica para cada muestra del conjunto de datos.
+
+Para obtener el gráfico SHAP:
+
+```{r shap}
+h2o.shap_summary_plot(model_gbm, test)
+```
+
+La figura anterior muestra un gráfico de resumen en el que cada punto del gráfico corresponde a una única fila del conjunto de datos. Para cada punto:
+
+  * El eje y de la izquierda indica las características por orden de importancia, de arriba a abajo, según sus valores de Shapley. El eje x se refiere a los valores SHAP reales.
+  * La posición horizontal de un punto representa el impacto de la característica en la predicción del modelo para esa muestra concreta, medido por la contribución del valor Shapley local.
+  * La barra de la derecha muestra los valores normalizados de las características en una escala de 0 a 1, representada por colores: el rojo indica un valor más alto y el azul un valor más bajo.
+
+Del gráfico resumen se deduce que el "tipo de interés" y el "plazo" tienen un mayor impacto total a la hora de predecir si una persona incumplirá el préstamo en comparación con otras características. Además, las personas con tipos de interés más altos y plazos más largos tienen una mayor probabilidad de impago que las demás.
+
+
+### Gráficos de Dependencia Parcial
+Un gráfico de dependencia parcial (PDP) ofrece una representación gráfica del efecto marginal de una variable sobre el resultado previsto. El efecto de una variable se mide en términos de cambio en la respuesta media. Las líneas o puntos verdes muestran la respuesta media frente al valor de la característica con barras de error.  El histograma gris muestra el número de casos para cada intervalo de valores de características. En el gráfico del tipo de interés, en la parte inferior izquierda, se observa que la tasa media de impago aumenta con el tipo de interés, pero también que los datos son cada vez más escasos para tipos de interés más altos.
+
+Es importante recordar que las PDP no tienen en cuenta ninguna interacción o correlación con otras características del modelo. Por lo tanto, es importante tener en cuenta otros factores que puedan afectar a la predicción a la hora de interpretar un gráfico de dependencia parcial. A continuación podemos ver las PDP para la parte superior de las variables más importantes del modelo.
+
+```{r partial, message=TRUE, warning=TRUE}
+h2o.pd_plot(model_gbm, test, column = 'addr_state')
+h2o.pd_plot(model_gbm, test, column = 'term')
+h2o.pd_plot(model_gbm, test, column = 'int_rate')
+h2o.pd_plot(model_gbm, test, column = 'purpose')
+h2o.pd_plot(model_gbm, test, column = 'annual_inc')
+```
+
+### Gráficos ICE (Individual Conditional Expectation)
+Un gráfico de expectativa condicional individual (ICE) es similar a un gráfico de dependencia parcial (PDP), ya que ambos visualizan la relación entre un resultado previsto y características individuales de un conjunto de datos. 
+
+La diferencia clave entre los dos es que los gráficos ICE muestran cómo cambia el resultado previsto a medida que cambia el valor de una característica concreta mientras se mantienen constantes todas las demás características. 
+
+Por el contrario, los gráficos de dependencia parcial muestran cómo cambia el resultado medio predicho a medida que cambia el valor de una característica concreta, manteniendo todas las demás características constantes. En otras palabras, el PDP muestra el efecto medio de una característica, mientras que el gráfico ICE muestra el efecto para una única instancia. En H2O-3, el gráfico ICE muestra el efecto de cada decil.
+
+
+Realizamos el gráfico ICE para la columna _int_rate_:
+
+```{r ice}
+h2o.ice_plot(model_gbm, test, column = 'int_rate')
+```
+
+El gráfico anterior muestra tanto un gráfico PDP como un gráfico ICE para la característica del tipo de interés. 
+
+Podemos comparar fácilmente el comportamiento medio estimado con el comportamiento local. Cuando las curvas de dependencia parcial e ICE divergen, es un indicio de que las PDP pueden no ser del todo fiables, o tal vez haya correlaciones o interacciones en las variables de entrada, algo a lo que hay que prestar atención antes de poner los modelos en producción.
+
+***
+
+## Explicatividad Local
+En la sección anterior, hemos examinado en detalle las explicaciones globales de los modelos individuales. Esta sección está dedicada a las explicaciones locales. Las explicaciones locales se refieren a las explicaciones proporcionadas a nivel local para ejemplos de entrada individuales. Esto significa que tales explicaciones se aplican sólo a una entrada específica y no al modelo en su conjunto. 
+
+Las explicaciones locales pueden ayudar a entender por qué un modelo ha hecho una predicción concreta para una entrada específica y pueden ayudar a los usuarios a confiar en las predicciones del modelo caso por caso.
+
+Se pueden generar las explicaciones locales para por ejemplo el caso 50de esta forma: `h2o.explain_row(model_gbm, test, row_index = 50)`
+
+Y en vez de obtener los gráficos de forma seguida, los podemos obtener de forma individualizada así:
+
+```{r}
+h2o.shap_explain_row_plot(model_gbm, test, row_index = 50)
+h2o.pd_plot(model_gbm, test, column = 'addr_state', row_index = 50)
+h2o.pd_plot(model_gbm, test, column = 'term', row_index = 50)
+h2o.pd_plot(model_gbm, test, column = 'int_rate', row_index = 50)
+h2o.pd_plot(model_gbm, test, column = 'purpose', row_index = 50)
+h2o.pd_plot(model_gbm, test, column = 'annual_inc', row_index = 50)
+
+h2o.shutdown(prompt = FALSE)
+```
+
